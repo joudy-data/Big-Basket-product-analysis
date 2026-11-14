@@ -27,8 +27,3 @@ The Streamlit dashboard allows users to explore products, filter results, compar
 ## Technologies Used
 Python, Pandas, NumPy, Matplotlib, Seaborn, Plotly, and Streamlit.
 
-## How to Run
-1. Install the required libraries:
-   `pip install -r requirements.txt`
-2. Launch the application:
-   `streamlit run app.py`
