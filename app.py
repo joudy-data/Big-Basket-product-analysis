@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -9,6 +10,7 @@ st.set_page_config(page_title="BigBasket Product Catalog", layout="wide")
 FOLDER = Path(__file__).resolve().parent
 GREEN = "#5B8C25"
 RED = "#DE4739"
+PRICE_BANDS = ["Under ₹100", "₹100–<250", "₹250–<500", "₹500–<1,000", "₹1,000+"]
 
 KAGGLE_URL = (
     "https://www.kaggle.com/datasets/"
@@ -27,6 +29,7 @@ COLUMNS = {
 }
 
 
+@st.cache_data
 def load_catalog(filename):
     path = FOLDER / filename
 
@@ -69,8 +72,12 @@ def show_cleaning_impact(before, after):
 
     fields = ["product_name", "brand", "description", "rating"]
     summary = pd.DataFrame({
-        "Check": ["Missing product names", "Missing brands",
-                  "Missing descriptions", "Missing ratings"],
+        "Check": [
+            "Missing product names",
+            "Missing brands",
+            "Missing descriptions",
+            "Missing ratings",
+        ],
         "Before": before[fields].isna().sum().tolist(),
         "After": after[fields].isna().sum().tolist(),
         "Cleaning decision": [
@@ -94,7 +101,7 @@ def show_cleaning_impact(before, after):
             return
 
         row = removed.iloc[0]
-        product_type = row.get("type", "Product")
+        product_type = row.get("product_type", row.get("type", "Product"))
         st.write(f"**Listing #{row['index']}** · {row['category']} · {product_type}")
         left, right = st.columns(2)
         left.markdown("**Before cleaning**")
@@ -120,6 +127,191 @@ def show_cleaning_impact(before, after):
     left.write("Blank")
     right.markdown("**After cleaning**")
     right.write(row[field])
+
+
+def show_price_relationship(products):
+    st.subheader("Market price vs. sale price")
+    valid = products.loc[
+        products["sale_price"].gt(0) & products["market_price"].gt(0),
+        ["product_name", "category", "market_price", "sale_price", "discount_pct"],
+    ].copy()
+
+    if valid.empty:
+        st.info("No listings have two positive prices in this selection.")
+        return
+
+    points = valid.sample(n=min(2500, len(valid)), random_state=42).fillna(
+        {"product_name": "Unknown", "category": "Unknown"}
+    )
+    points["Price comparison"] = "At market price"
+    points.loc[
+        points["sale_price"].lt(points["market_price"]), "Price comparison"
+    ] = "Below market price"
+    points.loc[
+        points["sale_price"].gt(points["market_price"]), "Price comparison"
+    ] = "Above market price"
+
+    minimum = float(valid[["market_price", "sale_price"]].min().min())
+    maximum = float(valid[["market_price", "sale_price"]].max().max())
+    domain = [minimum / 1.1, maximum * 1.1]
+    x = alt.X(
+        "market_price:Q",
+        title="Market price (₹, log scale)",
+        scale=alt.Scale(type="log", domain=domain),
+    )
+    y = alt.Y(
+        "sale_price:Q",
+        title="Sale price (₹, log scale)",
+        scale=alt.Scale(type="log", domain=domain),
+    )
+    diagonal = alt.Chart(
+        pd.DataFrame({"market_price": domain, "sale_price": domain})
+    ).mark_line(color="#5E6359", strokeDash=[5, 4]).encode(x=x, y=y)
+
+    scatter = alt.Chart(points).mark_circle(size=42, opacity=0.42).encode(
+        x=x,
+        y=y,
+        color=alt.Color(
+            "Price comparison:N",
+            scale=alt.Scale(
+                domain=["Below market price", "At market price", "Above market price"],
+                range=[GREEN, "#777D71", RED],
+            ),
+            legend=alt.Legend(title=None, orient="bottom"),
+        ),
+        tooltip=[
+            alt.Tooltip("product_name:N", title="Product"),
+            alt.Tooltip("category:N", title="Category"),
+            alt.Tooltip("market_price:Q", title="Market price (₹)", format=",.2f"),
+            alt.Tooltip("sale_price:Q", title="Sale price (₹)", format=",.2f"),
+            alt.Tooltip("discount_pct:Q", title="Discount (%)", format=".1f"),
+        ],
+    )
+    st.altair_chart((diagonal + scatter).properties(height=360), width="stretch")
+    st.caption(
+        f"Showing {len(points):,} of {len(valid):,} listings with two positive prices. "
+        "The dashed line marks equal prices. Points below it are discounted."
+    )
+
+
+def show_group_relationships(products, category):
+    st.subheader("Pricing and discounts by product group")
+    group = "category"
+    if category != "All categories" and "sub_category" in products:
+        group = "sub_category"
+    group_label = "Subcategory" if group == "sub_category" else "Category"
+
+    valid = products.loc[
+        products["sale_price"].ge(0), [group, "sale_price", "market_price"]
+    ].copy()
+    valid[group] = valid[group].fillna("Unknown")
+
+    if valid.empty:
+        st.info("No listings have a usable sale price in this selection.")
+        return
+
+    valid["comparable"] = valid["market_price"].gt(0)
+    valid["discounted"] = valid["comparable"] & valid["sale_price"].lt(valid["market_price"])
+    summary = valid.groupby(group, as_index=False).agg(
+        median_price=("sale_price", "median"),
+        listings=("sale_price", "size"),
+        comparable=("comparable", "sum"),
+        discounted=("discounted", "sum"),
+    )
+    summary["discount_share"] = summary["discounted"].div(
+        summary["comparable"].where(summary["comparable"].gt(0))
+    )
+    shown = summary.nlargest(12, "listings")
+    order = shown.sort_values("median_price", ascending=False)[group].tolist()
+
+    base = alt.Chart(shown).encode(y=alt.Y(f"{group}:N", sort=order, title=group_label))
+    left, right = st.columns(2)
+
+    with left:
+        st.altair_chart(
+            base.mark_bar(color=GREEN).encode(
+                x=alt.X("median_price:Q", title="Median sale price (₹)"),
+                tooltip=[
+                    alt.Tooltip(f"{group}:N", title=group_label),
+                    alt.Tooltip("median_price:Q", title="Median sale price (₹)", format=",.2f"),
+                    alt.Tooltip("listings:Q", title="Listings with sale price", format=","),
+                ],
+            ).properties(height=330),
+            width="stretch",
+        )
+
+    with right:
+        st.altair_chart(
+            base.mark_bar(color=RED).encode(
+                x=alt.X(
+                    "discount_share:Q",
+                    title="Share of listings discounted",
+                    axis=alt.Axis(format="%"),
+                    scale=alt.Scale(domain=[0, 1]),
+                ),
+                tooltip=[
+                    alt.Tooltip(f"{group}:N", title=group_label),
+                    alt.Tooltip("discount_share:Q", title="Discounted share", format=".1%"),
+                    alt.Tooltip("discounted:Q", title="Discounted listings", format=","),
+                    alt.Tooltip("comparable:Q", title="Listings with comparable prices", format=","),
+                ],
+            ).properties(height=330),
+            width="stretch",
+        )
+
+    st.caption(
+        f"Showing {len(shown)} of {len(summary)} {group_label.lower()} groups ranked by listing count. "
+        "Discount share uses listings with a valid sale price and a positive market price."
+    )
+
+
+def show_rating_relationship(products):
+    st.subheader("Sale price vs. customer rating")
+    eligible = products.loc[products["sale_price"].ge(0), ["sale_price", "rating"]].copy()
+
+    if eligible.empty or eligible["rating"].count() == 0:
+        st.info("No recorded ratings with a valid sale price in this selection.")
+        return
+
+    eligible["price_band"] = pd.cut(
+        eligible["sale_price"],
+        bins=[0, 100, 250, 500, 1000, float("inf")],
+        labels=PRICE_BANDS,
+        right=False,
+    )
+    summary = eligible.groupby("price_band", observed=True, as_index=False).agg(
+        mean_rating=("rating", "mean"),
+        rated=("rating", "count"),
+        listings=("rating", "size"),
+    )
+    summary["coverage"] = summary["rated"] / summary["listings"]
+
+    chart = alt.Chart(summary).mark_circle(color=GREEN, opacity=0.85).encode(
+        x=alt.X(
+            "price_band:N",
+            sort=PRICE_BANDS,
+            title="Sale-price band",
+            axis=alt.Axis(labelAngle=0),
+        ),
+        y=alt.Y(
+            "mean_rating:Q",
+            title="Average rating out of 5",
+            scale=alt.Scale(domain=[0, 5]),
+        ),
+        size=alt.Size("rated:Q", title="Rated listings", scale=alt.Scale(range=[60, 650])),
+        tooltip=[
+            alt.Tooltip("price_band:N", title="Price band"),
+            alt.Tooltip("mean_rating:Q", title="Average rating", format=".2f"),
+            alt.Tooltip("rated:Q", title="Rated listings", format=","),
+            alt.Tooltip("listings:Q", title="All listings", format=","),
+            alt.Tooltip("coverage:Q", title="Rating coverage", format=".1%"),
+        ],
+    )
+    st.altair_chart(chart.properties(height=300), width="stretch")
+    st.caption(
+        f"{eligible['rating'].count():,} of {len(eligible):,} listings with valid sale prices have a rating. "
+        "Larger dots represent more rated listings. Bands without ratings have no dot."
+    )
 
 
 def show_catalog(catalog, category, budget, cleaned=False):
@@ -151,21 +343,15 @@ def show_catalog(catalog, category, budget, cleaned=False):
     fourth.metric("Average rating", f"{mean_rating:.2f} / 5" if rated_count else "—")
     st.caption(f"The average uses {rated_count:,} recorded ratings out of {len(products):,} listings.")
 
-    st.subheader("Listings and discounts by category")
-    counts = products.groupby("category").size()
-    discount_counts = products.loc[discounted].groupby("category").size()
-    chart = pd.DataFrame({
-        "All listings": counts,
-        "Discounted listings": discount_counts.reindex(counts.index, fill_value=0),
-    }).sort_values("All listings", ascending=False)
-
-    st.bar_chart(chart, color=[GREEN, RED], stack=False)
+    show_price_relationship(products)
+    show_group_relationships(products, category)
+    show_rating_relationship(products)
 
     st.subheader("Product listings")
     table = products[list(COLUMNS)].rename(columns=COLUMNS).copy()
 
     if cleaned:
-        # Add friendly labels to the display table after calculating the metrics.
+        # Add display labels after calculating the metrics.
         table["Rating"] = table["Rating"].map(
             lambda value: "Not rated" if pd.isna(value) else f"{value:.1f}"
         )
@@ -239,7 +425,7 @@ budget = price_limit if use_budget else None
 
 view = st.radio(
     "Dashboard view",
-    ["Cleaning impact", "Before cleaning", "After cleaning"],
+    ["After cleaning", "Before cleaning", "Cleaning impact"],
     horizontal=True,
 )
 
